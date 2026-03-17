@@ -26,6 +26,8 @@ class AgentState(TypedDict):
 # ---- MCP server definitions ----
 
 def get_server_configs() -> dict:
+    # rag is handled directly in the main process now
+    # only spinning up MCP subprocesses for github, jira, and filesystem
     return {
         "filesystem": StdioServerParameters(
             command=sys.executable,
@@ -38,10 +40,6 @@ def get_server_configs() -> dict:
         "jira": StdioServerParameters(
             command=sys.executable,
             args=["mcp_servers/jira_server.py"]
-        ),
-        "rag": StdioServerParameters(
-            command=sys.executable,
-            args=["mcp_servers/rag_server.py"]
         )
     }
 
@@ -126,11 +124,11 @@ When answering questions:
     forced_tool = get_forced_tool(user_query)
     if forced_tool:
         server_name, actual_tool_name = forced_tool.split("__", 1)
-        print(f"  [router] forcing: {actual_tool_name} on {server_name}")
+        print(f"  [router] forcing: {actual_tool_name} on {server_name} (direct)")
 
-        session = sessions.get(server_name)
-        result_text = await call_tool_on_session(session, actual_tool_name, {"query": user_query})
-        tool_results.append({"server": server_name, "tool": actual_tool_name, "result": result_text})
+        # querying qdrant directly from the main process to avoid subprocess network issues
+        result_text = query_qdrant_directly(user_query)
+        tool_results.append({"server": "rag", "tool": "query_rag_memory", "result": result_text})
 
         # injecting the retrieved content so the model synthesizes from it
         synthesis_messages = [
