@@ -5,6 +5,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 from dotenv import load_dotenv
+import sys
 
 load_dotenv()
 
@@ -160,5 +161,6 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     asyncio.run(main())
