@@ -122,31 +122,11 @@ if st.session_state.pending_approval:
         if st.button("Approve and create ticket", type="primary", use_container_width=True):
             with st.spinner("Creating ticket..."):
                 try:
-                    # calling the jira server directly to execute the approved action
-                    import asyncio
-                    from mcp import ClientSession, StdioServerParameters
-                    from mcp.client.stdio import stdio_client
-                    import sys
-
-                    async def execute_approved():
-                        params = StdioServerParameters(
-                            command=sys.executable,
-                            args=["mcp_servers/jira_server.py"]
-                        )
-                        async with stdio_client(params) as (read, write):
-                            async with ClientSession(read, write) as session:
-                                await session.initialize()
-                                result = await session.call_tool(
-                                    "create_jira_ticket",
-                                    pending["tool_input"]
-                                )
-                                return result.content[0].text if result.content else "Ticket created."
-
+                    from agent.graph import create_jira_ticket
                     loop = asyncio.new_event_loop()
                     asyncio.set_event_loop(loop)
-                    answer = loop.run_until_complete(execute_approved())
+                    answer = loop.run_until_complete(create_jira_ticket(**pending["tool_input"]))
                     loop.close()
-
                 except Exception as e:
                     answer = f"Error creating ticket: {str(e)}"
 

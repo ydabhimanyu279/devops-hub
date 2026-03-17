@@ -1,19 +1,259 @@
 import asyncio
 import sys
 import os
+import base64
+import httpx
 from typing import TypedDict, Annotated
 from contextlib import AsyncExitStack
 from dotenv import load_dotenv
 import anthropic
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from qdrant_client import QdrantClient
+from fastembed import TextEmbedding
 import operator
 
 load_dotenv()
 
-# using haiku — cheapest claude model, fast, good enough for dev and demo
 MODEL = "claude-haiku-4-5-20251001"
 
+# ---- direct API clients (no MCP subprocesses) ----
+# running everything in the main process so Streamlit Cloud's sandbox
+# doesn't kill subprocess connections
+
+GITHUB_HEADERS = {
+    "Authorization": f"Bearer {os.getenv('GITHUB_TOKEN')}",
+    "Accept": "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28"
+}
+
+JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
+JIRA_AUTH = (os.getenv("JIRA_EMAIL"), os.getenv("JIRA_API_TOKEN"))
+JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
+JIRA_HEADERS = {"Accept": "application/json", "Content-Type": "application/json"}
+
+_qdrant_client = None
+_embed_model = None
+
+
+def get_qdrant_client():
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = QdrantClient(
+            url=os.getenv("QDRANT_URL"),
+            api_key=os.getenv("QDRANT_API_KEY")
+        )
+    return _qdrant_client
+
+
+def get_embed_model():
+    global _embed_model
+    if _embed_model is None:
+        _embed_model = TextEmbedding(model_name="BAAI/bge-small-en-v1.5")
+    return _embed_model
+
+
+# ---- tool implementations ----
+
+def query_rag(query: str) -> str:
+    client = get_qdrant_client()
+    model = get_embed_model()
+    query_vector = list(model.embed([query]))[0].tolist()
+    results = client.query_points(
+        collection_name="adrs",
+        query=query_vector,
+        limit=3,
+        with_payload=True
+    ).points
+    if not results:
+        return "No relevant documents found."
+    parts = []
+    for i, r in enumerate(results):
+        parts.append(f"[{i+1}] {r.payload.get('filename')} (score: {round(r.score, 3)})\n\n{r.payload.get('content')}")
+    return "\n\n---\n\n".join(parts)
+
+
+async def list_github_repos() -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            "https://api.github.com/user/repos?sort=updated&per_page=20",
+            headers=GITHUB_HEADERS
+        )
+        if resp.status_code != 200:
+            return f"GitHub error: {resp.status_code}"
+        repos = resp.json()
+        lines = [f"{r['full_name']} — {r['description'] or 'no description'}" for r in repos]
+        return "\n".join(lines)
+
+
+async def list_github_commits(repo: str, branch: str = "main", limit: int = 10) -> str:
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"https://api.github.com/repos/{repo}/commits?sha={branch}&per_page={limit}",
+            headers=GITHUB_HEADERS
+        )
+        if resp.status_code != 200:
+            return f"GitHub error: {resp.status_code}"
+        commits = resp.json()
+        lines = []
+        for c in commits:
+            sha = c["sha"][:7]
+            msg = c["commit"]["message"].split("\n")[0]
+            author = c["commit"]["author"]["name"]
+            date = c["commit"]["author"]["date"][:10]
+            lines.append(f"{sha} | {date} | {author} | {msg}")
+        return "\n".join(lines)
+
+
+async def search_jira_tickets(keyword: str = "", status: str = "") -> str:
+    jql_parts = [f"project = {JIRA_PROJECT_KEY}"]
+    if keyword:
+        jql_parts.append(f'summary ~ "{keyword}"')
+    if status:
+        jql_parts.append(f'status = "{status}"')
+    jql = " AND ".join(jql_parts) + " ORDER BY created DESC"
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
+            params={"jql": jql, "maxResults": 20, "fields": "summary,status,assignee"},
+            headers=JIRA_HEADERS,
+            auth=JIRA_AUTH
+        )
+        if resp.status_code != 200:
+            return f"Jira error: {resp.status_code}"
+        issues = resp.json().get("issues", [])
+        if not issues:
+            return "No tickets found."
+        lines = []
+        for issue in issues:
+            key = issue["key"]
+            summary = issue["fields"]["summary"]
+            status = issue["fields"]["status"]["name"]
+            assignee = issue["fields"].get("assignee")
+            name = assignee["displayName"] if assignee else "Unassigned"
+            lines.append(f"{key} | {status} | {name} | {summary}")
+        return "\n".join(lines)
+
+
+async def create_jira_ticket(summary: str, description: str, issue_type: str = "Task") -> str:
+    payload = {
+        "fields": {
+            "project": {"key": JIRA_PROJECT_KEY},
+            "summary": summary,
+            "description": {
+                "type": "doc",
+                "version": 1,
+                "content": [{"type": "paragraph", "content": [{"type": "text", "text": description}]}]
+            },
+            "issuetype": {"name": issue_type}
+        }
+    }
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            f"{JIRA_BASE_URL}/rest/api/3/issue",
+            json=payload,
+            headers=JIRA_HEADERS,
+            auth=JIRA_AUTH
+        )
+        if resp.status_code not in (200, 201):
+            return f"Jira error: {resp.status_code} {resp.text}"
+        return f"Ticket created: {resp.json().get('key')} — {summary}"
+
+
+def read_workspace_file(filename: str) -> str:
+    from pathlib import Path
+    workspace = Path("workspace")
+    filepath = workspace / filename
+    if not filepath.exists():
+        return f"File '{filename}' not found."
+    return filepath.read_text(encoding="utf-8")
+
+
+def list_workspace_files() -> str:
+    from pathlib import Path
+    workspace = Path("workspace")
+    if not workspace.exists():
+        return "Workspace directory not found."
+    files = [f.name for f in workspace.iterdir() if f.is_file()]
+    return "\n".join(files) if files else "No files found."
+
+
+# ---- tool definitions for Claude ----
+
+TOOLS = [
+    {
+        "name": "list_github_repos",
+        "description": "List all GitHub repositories for the authenticated user.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "list_github_commits",
+        "description": "List recent commits on a GitHub repo branch.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "owner/repo format"},
+                "branch": {"type": "string", "description": "branch name, defaults to main"},
+                "limit": {"type": "integer", "description": "number of commits"}
+            },
+            "required": ["repo"]
+        }
+    },
+    {
+        "name": "search_jira_tickets",
+        "description": "Search Jira tickets by keyword or status.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keyword": {"type": "string", "description": "search term"},
+                "status": {"type": "string", "description": "To Do, In Progress, or Done"}
+            }
+        }
+    },
+    {
+        "name": "create_jira_ticket",
+        "description": "Create a Jira ticket. Requires human approval.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "description": {"type": "string"},
+                "issue_type": {"type": "string", "description": "Bug, Task, or Story"}
+            },
+            "required": ["summary", "description", "issue_type"]
+        }
+    },
+    {
+        "name": "list_workspace_files",
+        "description": "List files in the local workspace directory.",
+        "input_schema": {"type": "object", "properties": {}}
+    },
+    {
+        "name": "read_workspace_file",
+        "description": "Read a file from the local workspace.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string"}
+            },
+            "required": ["filename"]
+        }
+    },
+    {
+        "name": "query_rag_memory",
+        "description": "Semantic search over architecture decision records.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"}
+            },
+            "required": ["query"]
+        }
+    }
+]
+
+WRITE_TOOLS = {"create_jira_ticket"}
+
+# ---- state ----
 
 class AgentState(TypedDict):
     messages: Annotated[list, operator.add]
@@ -23,139 +263,94 @@ class AgentState(TypedDict):
     pending_input: dict
 
 
-# ---- MCP server definitions ----
-
-def get_server_configs() -> dict:
-    # rag is handled directly in the main process now
-    # only spinning up MCP subprocesses for github, jira, and filesystem
-    return {
-        "filesystem": StdioServerParameters(
-            command=sys.executable,
-            args=["mcp_servers/filesystem_server.py"]
-        ),
-        "github": StdioServerParameters(
-            command=sys.executable,
-            args=["mcp_servers/github_server.py"]
-        ),
-        "jira": StdioServerParameters(
-            command=sys.executable,
-            args=["mcp_servers/jira_server.py"]
-        )
-    }
-
-
-async def get_tools_from_session(session: ClientSession, server_name: str) -> list:
-    # converting MCP tool format to Anthropic's tool format and namespacing by server
-    response = await session.list_tools()
-    tools = []
-    for tool in response.tools:
-        tools.append({
-            "name": f"{server_name}__{tool.name}",
-            "description": tool.description,
-            "input_schema": tool.inputSchema
-        })
-    return tools
-
-
-async def call_tool_on_session(session: ClientSession, tool_name: str, tool_input: dict) -> str:
-    result = await session.call_tool(tool_name, tool_input)
-    return result.content[0].text if result.content else "No result returned."
-
-
-# ---- Explicit router ----
+# ---- router ----
 
 def get_forced_tool(query: str) -> str | None:
-    # keyword routing for high-confidence cases so I'm not relying on the model
-    # to pick the right tool when there are 8 options — transparent and debuggable
     q = query.lower()
     rag_keywords = [
         "architecture", "adr", "compliance", "standard", "rule", "best practice",
         "oauth", "auth", "database access", "api design", "knowledge base"
     ]
     if any(k in q for k in rag_keywords):
-        return "rag__query_rag_memory"
+        return "query_rag_memory"
     return None
 
 
-# write actions that require human approval before executing
-WRITE_TOOLS = {"jira__create_jira_ticket"}
+# ---- tool executor ----
+
+async def execute_tool(tool_name: str, tool_input: dict) -> str:
+    if tool_name == "list_github_repos":
+        return await list_github_repos()
+    elif tool_name == "list_github_commits":
+        return await list_github_commits(**tool_input)
+    elif tool_name == "search_jira_tickets":
+        return await search_jira_tickets(**tool_input)
+    elif tool_name == "create_jira_ticket":
+        return await create_jira_ticket(**tool_input)
+    elif tool_name == "list_workspace_files":
+        return list_workspace_files()
+    elif tool_name == "read_workspace_file":
+        return read_workspace_file(**tool_input)
+    elif tool_name == "query_rag_memory":
+        return query_rag(tool_input.get("query", ""))
+    return f"Unknown tool: {tool_name}"
 
 
-async def hitl_check_node(
-    tool_name: str,
-    tool_input: dict
-) -> dict:
-    # returning the pending action instead of executing it
-    # the UI will render approval buttons and resume from here if approved
-    return {
-        "pending_approval": True,
-        "tool_name": tool_name,
-        "tool_input": tool_input
-    }
+# ---- agent ----
 
-
-
-
-async def input_node(state: AgentState) -> AgentState:
-    return state
-
-
-async def tool_decision_and_execution_node(
-    state: AgentState,
-    sessions: dict,
-    tools: list
-) -> AgentState:
+async def run_agent(user_query: str) -> dict:
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
     system_prompt = """You are the Agentic DevOps Intelligence Hub.
-You have MCP connections to GitHub, Jira, a local filesystem, and a RAG knowledge base of architecture decision records.
+You have tools to query GitHub, Jira, a local filesystem, and a RAG knowledge base of architecture decision records.
 
 When answering questions:
-- For incident analysis: check filesystem, GitHub commits, and Jira tickets
+- For incident analysis: check workspace files, GitHub commits, and Jira tickets
 - For sprint summaries: pull GitHub commits and Jira ticket statuses
 - Always cite exact commit SHAs, Jira ticket keys, and ADR numbers
 - Be decisive — give root causes and recommendations, not just raw data"""
 
     tool_results = []
-    user_query = state["messages"][-1]["content"]
     messages = [{"role": "user", "content": user_query}]
 
-    # checking if this query should bypass the model and go straight to a specific tool
+    # direct RAG for architecture queries
     forced_tool = get_forced_tool(user_query)
     if forced_tool:
-        server_name, actual_tool_name = forced_tool.split("__", 1)
-        print(f"  [router] forcing: {actual_tool_name} on {server_name} (direct)")
+        print(f"  [router] forcing: {forced_tool}")
+        result_text = query_rag(user_query)
+        tool_results.append({"server": "rag", "tool": forced_tool, "result": result_text})
 
-        # querying qdrant directly from the main process to avoid subprocess network issues
-        result_text = query_qdrant_directly(user_query)
-        tool_results.append({"server": "rag", "tool": "query_rag_memory", "result": result_text})
-
-        # injecting the retrieved content so the model synthesizes from it
-        synthesis_messages = [
-            {"role": "user", "content": f"Here is the relevant content from the knowledge base:\n\n{result_text}\n\nUsing only this content, answer: {user_query}"}
-        ]
+        synthesis_messages = [{
+            "role": "user",
+            "content": f"Here is the relevant content from the knowledge base:\n\n{result_text}\n\nUsing only this content, answer: {user_query}"
+        }]
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
             system=system_prompt,
             messages=synthesis_messages
         )
-        final_answer = response.content[0].text if response.content else ""
-        return {**state, "messages": messages, "tool_results": tool_results, "final_answer": final_answer}
+        return {
+            "messages": messages,
+            "tool_results": tool_results,
+            "final_answer": response.content[0].text,
+            "pending_tool": "",
+            "pending_input": {}
+        }
 
-    # general agentic loop for queries not matched by the router
+    # general agentic loop
     while True:
         response = client.messages.create(
             model=MODEL,
             max_tokens=4096,
             system=system_prompt,
-            tools=tools,
+            tools=TOOLS,
             messages=messages
         )
 
         if response.stop_reason == "end_turn":
             final_text = next((b.text for b in response.content if hasattr(b, "text")), "")
-            return {**state, "messages": messages, "tool_results": tool_results, "final_answer": final_text}
+            return {"messages": messages, "tool_results": tool_results, "final_answer": final_text, "pending_tool": "", "pending_input": {}}
 
         elif response.stop_reason == "tool_use":
             messages.append({"role": "assistant", "content": response.content})
@@ -163,32 +358,22 @@ When answering questions:
 
             for block in response.content:
                 if block.type == "tool_use":
-                    full_tool_name = block.name
+                    tool_name = block.name
                     tool_input = block.input or {}
 
-                    if "__" in full_tool_name:
-                        server_name, actual_tool_name = full_tool_name.split("__", 1)
-                    else:
-                        server_name, actual_tool_name = "filesystem", full_tool_name
-
-                    # intercepting write actions before they execute
-                    if full_tool_name in WRITE_TOOLS:
-                        print(f"  [HITL] write action detected: {actual_tool_name} — returning for approval")
+                    if tool_name in WRITE_TOOLS:
+                        print(f"  [HITL] write action detected: {tool_name}")
                         return {
-                            **state,
                             "messages": messages,
                             "tool_results": tool_results,
                             "final_answer": "__HITL_PENDING__",
-                            "pending_tool": full_tool_name,
+                            "pending_tool": tool_name,
                             "pending_input": tool_input
                         }
 
-                    print(f"  [{server_name}] calling {actual_tool_name} with {tool_input}")
-
-                    session = sessions.get(server_name)
-                    result_text = await call_tool_on_session(session, actual_tool_name, tool_input) if session else f"No session for {server_name}"
-                    tool_results.append({"server": server_name, "tool": actual_tool_name, "result": result_text})
-
+                    print(f"  calling {tool_name} with {tool_input}")
+                    result_text = await execute_tool(tool_name, tool_input)
+                    tool_results.append({"server": "direct", "tool": tool_name, "result": result_text})
                     tool_result_content.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -200,51 +385,4 @@ When answering questions:
         else:
             break
 
-    return {**state, "messages": messages, "tool_results": tool_results, "final_answer": "Agent stopped unexpectedly."}
-
-
-async def output_node(state: AgentState) -> AgentState:
-    print("\n--- Agent Response ---")
-    print(state["final_answer"])
-    return state
-
-
-# ---- Main entry point ----
-
-async def run_agent(user_query: str):
-    server_configs = get_server_configs()
-    sessions = {}
-    all_tools = []
-
-    async with AsyncExitStack() as stack:
-        for server_name, params in server_configs.items():
-            read, write = await stack.enter_async_context(stdio_client(params))
-            session = await stack.enter_async_context(ClientSession(read, write))
-            await session.initialize()
-
-            tools = await get_tools_from_session(session, server_name)
-            sessions[server_name] = session
-            all_tools.extend(tools)
-            print(f"connected to {server_name} — {len(tools)} tools")
-
-        print(f"\ntotal tools available: {len(all_tools)}\n")
-
-        initial_state: AgentState = {
-            "messages": [{"role": "user", "content": user_query}],
-            "tool_results": [],
-            "final_answer": "",
-            "pending_tool": "",
-            "pending_input": {}
-        }
-
-        state = await input_node(initial_state)
-        state = await tool_decision_and_execution_node(state, sessions, all_tools)
-        state = await output_node(state)
-
-        return state
-
-
-if __name__ == "__main__":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    query = "What are our architecture rules around authentication and OAuth?"
-    asyncio.run(run_agent(query))
+    return {"messages": messages, "tool_results": tool_results, "final_answer": "Agent stopped unexpectedly.", "pending_tool": "", "pending_input": {}}
