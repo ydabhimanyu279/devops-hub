@@ -1,0 +1,1 @@
+"Service crashed at 03:42 UTC. On-call engineer paged. Root cause: memory leak in payment-service v2.1.4. Fix deployed at 04:15 UTC via hotfix commit a3f9c12." 

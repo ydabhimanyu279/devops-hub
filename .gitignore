@@ -1,0 +1,19 @@
+# environment variables — never commit these
+.env
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# qdrant local storage if docker was used
+storage/
+
+# test files
+test*.py
+scripts/test*.py
+
+# streamlit
+.streamlit/secrets.toml
